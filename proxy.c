@@ -32,45 +32,66 @@ int main(int argc, char *argv[]) {
     parse_args(argc, argv);
 
     // TODO: Initialize OpenSSL library
-    
+    SSL_library_init();
+    //or for newer OPENSSL_init_ssl(0, NULL);
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+
     
     // TODO: Create SSL context and load certificate/private key files
     // Files: "server.crt" and "server.key"
-    SSL_CTX *ssl_ctx = NULL;
-    
-    if (ssl_ctx == NULL) {
+
+    //SSL_CTX *ssl_ctx;
+
+    // For a server:
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+
+    if ( SSL_CTX_use_certificate_file(ctx, "server.crt", SSL_FILETYPE_PEM) <=0) {
+        fprintf(stderr, "Error: Unable to load certificate file\n");
+        exit(EXIT_FAILURE);
+    }
+    if( SSL_CTX_use_PrivateKey_file(ctx,"server.key", SSL_FILETYPE_PEM) <=0) {
+        fprintf(stderr, "Error: Unable to load private key file\n");
+        exit(EXIT_FAILURE);
+    }   
+    if (!SSL_CTX_check_private_key(ctx)) {
+    fprintf(stderr, "Private key does not match the certificate\n");
+    exit(EXIT_FAILURE);
+    }
+
+    if (ctx== NULL) {
         fprintf(stderr, "Error: SSL context not initialized\n");
         exit(EXIT_FAILURE);
     }
 
-    server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    server_socket = socket(AF_INET, SOCK_STREAM, 0); // IPv4 socket stream default protocol 
     if (server_socket == -1) {
-        perror("socket failed");
+        perror("socket failed"); //failure to create socket
         exit(EXIT_FAILURE);
     }
 
     int optval = 1;
-    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)); //lets addres get reused
 
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(LOCAL_PORT_TO_CLIENT);
+    server_addr.sin_family = AF_INET; //ipv4
+    server_addr.sin_addr.s_addr = INADDR_ANY; //all network interfaces (localhost, wifi, etc)
+    server_addr.sin_port = htons(LOCAL_PORT_TO_CLIENT); //listen in port 8443
 
-    if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
+    if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) { //reserve port for socket 
         perror("bind failed");
         exit(EXIT_FAILURE);
     }
 
 
-    if (listen(server_socket, 10) == -1) {
+    if (listen(server_socket, 10) == -1) { //turn into listening socket allow 10 pending requests 
         perror("listen failed");
         exit(EXIT_FAILURE);
     }
 
     printf("Proxy server listening on port %d\n", LOCAL_PORT_TO_CLIENT);
 
-    while (1) {
-        client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
+    while (1) { //wait for client connections
+        client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len); //create socket for specific client connection gives back file descriptor
         if (client_socket == -1) {
             perror("accept failed");
             continue;
@@ -79,16 +100,20 @@ int main(int argc, char *argv[]) {
         printf("Accepted connection from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
         
         // TODO: Create SSL structure for this connection and perform SSL handshake
-        SSL *ssl = NULL;
-        
-        
-        if (ssl != NULL) {
-            handle_request(ssl);
+        SSL *tls_connection = SSL_new(ctx); //tls session using the tls config(ctx)certificate, key, create a secure connection for one client 
+        SSL_set_fd(tls_connection, client_socket); //attach tls session to client tcp socket, tells tls connection what tcp socket to use for send and recieve
+        int handshake = SSL_accept(tls_connection); //perform the tls handshake for this tls session 
+        if (handshake <= 0) {
+            ERR_print_errors_fp(stderr);
+            SSL_free(tls_connection);
+            close(client_socket);
+            continue;
+        } else {
+            printf("SSL handshake successful\n");
         }
         
         // TODO: Clean up SSL connection
-        
-        
+        SSL_free(tls_connection); //cleans up for the next client and avoid memory leaks
         close(client_socket);
     }
 
