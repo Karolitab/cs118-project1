@@ -4,10 +4,9 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
-#include <ctype.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <ctype.h>
 
 #define BUFFER_SIZE 1024
 #define LOCAL_PORT_TO_CLIENT 8443
@@ -19,79 +18,46 @@ void send_local_file(SSL *ssl, const char *path);
 void proxy_remote_file(SSL *ssl, const char *request);
 int file_exists(const char *filename);
 
-static int send_all_ssl(SSL *ssl, const void *buf, int len)
+/* ---- URL decode helpers (for spaces, % signs, etc.) ---- */
+static int hex_value(char c)
 {
-    const unsigned char *p = (const unsigned char *)buf;
-    int sent = 0;
-    while (sent < len)
-    {
-        int n = SSL_write(ssl, p + sent, len - sent);
-        if (n <= 0)
-            return 0;
-        sent += n;
-    }
-    return 1;
+    if ('0' <= c && c <= '9')
+        return c - '0';
+    if ('a' <= c && c <= 'f')
+        return 10 + (c - 'a');
+    if ('A' <= c && c <= 'F')
+        return 10 + (c - 'A');
+    return -1;
 }
 
-static void url_decode_inplace(char *s)
+static void url_decode(const char *src, char *dst, size_t dst_size)
 {
-    char *dst = s;
-    for (char *src = s; *src; src++)
-    {
-        if (*src == '+')
-        {
-            *dst++ = ' ';
-        }
-        else if (*src == '%' &&
-                 isxdigit((unsigned char)src[1]) &&
-                 isxdigit((unsigned char)src[2]))
-        {
-            char hex[3] = {src[1], src[2], 0};
-            *dst++ = (char)strtol(hex, NULL, 16);
-            src += 2;
-        }
-        else
-        {
-            *dst++ = *src;
-        }
-    }
-    *dst = '\0';
-}
+    /* robust approach */
+    if (!src || !dst || dst_size == 0)
+        return;
 
-static const char *content_type_for_path(const char *path)
-{
-    const char *ext = strrchr(path, '.');
-    if (!ext)
-        return "application/octet-stream";
-    if (strcmp(ext, ".html") == 0 || strcmp(ext, ".htm") == 0)
-        return "text/html; charset=UTF-8";
-    if (strcmp(ext, ".txt") == 0)
-        return "text/plain; charset=UTF-8";
-    if (strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0)
-        return "image/jpeg";
-    if (strcmp(ext, ".m3u8") == 0)
-        return "application/vnd.apple.mpegurl";
-    return "application/octet-stream";
-}
-
-static int read_request_headers(SSL *ssl, char *buf, size_t cap, size_t *out_len)
-{
-    size_t used = 0;
-    buf[0] = '\0';
-    while (used + 1 < cap)
+    size_t di = 0;
+    for (size_t si = 0; src[si] != '\0' && di + 1 < dst_size; si++)
     {
-        int n = SSL_read(ssl, buf + used, (int)(cap - used - 1));
-        if (n <= 0)
-            return 0;
-        used += (size_t)n;
-        buf[used] = '\0';
-        if (strstr(buf, "\r\n\r\n") != NULL)
-            break;
-        if (used + 1 >= cap)
-            break;
+        if (src[si] == '%' &&
+            src[si + 1] != '\0' &&
+            src[si + 2] != '\0' &&
+            isxdigit((unsigned char)src[si + 1]) &&
+            isxdigit((unsigned char)src[si + 2]))
+        {
+
+            int hi = hex_value(src[si + 1]);
+            int lo = hex_value(src[si + 2]);
+            if (hi >= 0 && lo >= 0)
+            {
+                dst[di++] = (char)((hi << 4) | lo);
+                si += 2;
+                continue;
+            }
+        }
+        dst[di++] = src[si];
     }
-    *out_len = used;
-    return 1;
+    dst[di] = '\0';
 }
 
 // TODO: Parse command-line arguments (-b/-r/-p) and override defaults.
@@ -146,29 +112,29 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
-    server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    server_socket = socket(AF_INET, SOCK_STREAM, 0); // IPv4 socket stream default protocol
     if (server_socket == -1)
     {
-        perror("socket failed");
+        perror("socket failed"); // failure to create socket
         exit(EXIT_FAILURE);
     }
 
     int optval = 1;
-    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)); // lets addres get reused
 
     memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(LOCAL_PORT_TO_CLIENT);
+    server_addr.sin_family = AF_INET;                   // ipv4
+    server_addr.sin_addr.s_addr = INADDR_ANY;           // all network interfaces (localhost, wifi, etc)
+    server_addr.sin_port = htons(LOCAL_PORT_TO_CLIENT); // listen in port 8443
 
     if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1)
-    {
+    { // reserve port for socket
         perror("bind failed");
         exit(EXIT_FAILURE);
     }
 
     if (listen(server_socket, 10) == -1)
-    {
+    { // turn into listening socket allow 10 pending requests
         perror("listen failed");
         exit(EXIT_FAILURE);
     }
@@ -176,9 +142,9 @@ int main(int argc, char *argv[])
     printf("Proxy server listening on port %d\n", LOCAL_PORT_TO_CLIENT);
 
     while (1)
-    {
+    { // wait for client connections
         client_len = sizeof(client_addr);
-        client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_len);
+        client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_len); // create socket for specific client connection gives back file descriptor
         if (client_socket == -1)
         {
             perror("accept failed");
@@ -188,9 +154,9 @@ int main(int argc, char *argv[])
         printf("Accepted connection from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
         // TODO: Create SSL structure for this connection and perform SSL handshake
-        SSL *tls_connection = SSL_new(ctx);
-        SSL_set_fd(tls_connection, client_socket);
-        int handshake = SSL_accept(tls_connection);
+        SSL *tls_connection = SSL_new(ctx);         // tls session using the tls config(ctx)certificate, key, create a secure connection for one client
+        SSL_set_fd(tls_connection, client_socket);  // attach tls session to client tcp socket, tells tls connection what tcp socket to use for send and recieve
+        int handshake = SSL_accept(tls_connection); // perform the tls handshake for this tls session
         if (handshake <= 0)
         {
             ERR_print_errors_fp(stderr);
@@ -203,17 +169,18 @@ int main(int argc, char *argv[])
             printf("SSL handshake successful\n");
         }
 
+        /* HTTPS server functionality starts here (HTTP parsing + file serving) */
         handle_request(tls_connection);
 
-        SSL_shutdown(tls_connection);
-
         // TODO: Clean up SSL connection
-        SSL_free(tls_connection);
+        SSL_shutdown(tls_connection);
+        SSL_free(tls_connection); // cleans up for the next client and avoid memory leaks
         close(client_socket);
     }
 
     close(server_socket);
     // TODO: Clean up SSL context
+    SSL_CTX_free(ctx);
 
     return 0;
 }
@@ -236,83 +203,78 @@ void handle_request(SSL *ssl)
     char buffer[BUFFER_SIZE];
     ssize_t bytes_read;
 
+    /* Read until end of headers */
+    char request[8192];
+    int total = 0;
+    request[0] = '\0';
+
     // TODO: Read request from SSL connection
-    size_t req_len = 0;
-    if (!read_request_headers(ssl, buffer, sizeof(buffer), &req_len))
+    while (1)
     {
+        bytes_read = SSL_read(ssl, buffer, (int)sizeof(buffer));
+        if (bytes_read <= 0)
+        {
+            return;
+        }
+
+        if (total + bytes_read >= (int)sizeof(request) - 1)
+        {
+            /* Too large; just stop */
+            return;
+        }
+
+        memcpy(request + total, buffer, (size_t)bytes_read);
+        total += (int)bytes_read;
+        request[total] = '\0';
+
+        if (strstr(request, "\r\n\r\n") != NULL)
+            break;
+    }
+
+    /* Parse request line: METHOD SP PATH SP VERSION */
+    char *line_end = strstr(request, "\r\n");
+    if (!line_end)
         return;
-    }
-    bytes_read = (ssize_t)req_len;
 
-    if (bytes_read <= 0)
-    {
+    char first_line[1024];
+    int line_len = (int)(line_end - request);
+    if (line_len <= 0 || line_len >= (int)sizeof(first_line))
         return;
-    }
 
-    buffer[bytes_read] = '\0';
+    memcpy(first_line, request, (size_t)line_len);
+    first_line[line_len] = '\0';
 
-    char request_line[BUFFER_SIZE];
-    strncpy(request_line, buffer, sizeof(request_line) - 1);
-    request_line[sizeof(request_line) - 1] = '\0';
-
-    char *method = strtok(request_line, " \t\r\n");
-    char *path = strtok(NULL, " \t\r\n");
-    char *http_version = strtok(NULL, "\r\n");
-
-    if (!method || !path || !http_version)
-    {
-        const char *resp =
-            "HTTP/1.1 400 Bad Request\r\n"
-            "Content-Type: text/plain; charset=UTF-8\r\n"
-            "Content-Length: 12\r\n\r\n"
-            "Bad Request";
-        send_all_ssl(ssl, resp, (int)strlen(resp));
+    char method[16], path[1024], version[16];
+    if (sscanf(first_line, "%15s %1023s %15s", method, path, version) != 3)
         return;
-    }
 
-    if (strcmp(method, "GET") != 0)
+    char decoded_path[1024];
+    url_decode(path, decoded_path, sizeof(decoded_path));
+
+    char file_name[1024];
+    if (strcmp(decoded_path, "/") == 0)
     {
-        const char *resp =
-            "HTTP/1.1 405 Method Not Allowed\r\n"
-            "Content-Type: text/plain; charset=UTF-8\r\n"
-            "Content-Length: 18\r\n\r\n"
-            "Method Not Allowed";
-        send_all_ssl(ssl, resp, (int)strlen(resp));
-        return;
+        strcpy(file_name, "index.html");
     }
-
-    char path_buf[BUFFER_SIZE];
-    strncpy(path_buf, path, sizeof(path_buf) - 1);
-    path_buf[sizeof(path_buf) - 1] = '\0';
-
-    char *q = strchr(path_buf, '?');
-    if (q)
-        *q = '\0';
-
-    url_decode_inplace(path_buf);
-
-    if (strcmp(path_buf, "/") == 0 || path_buf[0] == '\0')
+    else if (decoded_path[0] == '/')
     {
-        strncpy(path_buf, "/index.html", sizeof(path_buf) - 1);
-        path_buf[sizeof(path_buf) - 1] = '\0';
-    }
-
-    const char *p = path_buf;
-    if (*p == '/')
-        p++;
-
-    char local_path[BUFFER_SIZE];
-    snprintf(local_path, sizeof(local_path), "%s", p);
-
-    if (file_exists(local_path))
-    {
-        printf("Sending local file %s\n", local_path);
-        send_local_file(ssl, local_path);
+        strncpy(file_name, decoded_path + 1, sizeof(file_name) - 1);
+        file_name[sizeof(file_name) - 1] = '\0';
     }
     else
     {
-        printf("Proxying remote file %s\n", local_path);
-        proxy_remote_file(ssl, buffer);
+        strncpy(file_name, decoded_path, sizeof(file_name) - 1);
+        file_name[sizeof(file_name) - 1] = '\0';
+    }
+
+    /* Serve local file if it exists; otherwise 404 */
+    if (file_exists(file_name))
+    {
+        send_local_file(ssl, file_name);
+    }
+    else
+    {
+        send_local_file(ssl, file_name); /* send_local_file handles 404 internally */
     }
 }
 
@@ -322,53 +284,87 @@ void send_local_file(SSL *ssl, const char *path)
 {
     FILE *file = fopen(path, "rb");
     char buffer[BUFFER_SIZE];
-    size_t bytes_read;
 
     if (!file)
     {
-        printf("File %s not found\n", path);
         const char *body =
             "<!DOCTYPE html><html><head><title>404 Not Found</title></head>"
             "<body><h1>404 Not Found</h1></body></html>";
-        char header[256];
-        int body_len = (int)strlen(body);
+        char header[512];
         int header_len = snprintf(header, sizeof(header),
                                   "HTTP/1.1 404 Not Found\r\n"
                                   "Content-Type: text/html; charset=UTF-8\r\n"
-                                  "Content-Length: %d\r\n\r\n",
-                                  body_len);
+                                  "Content-Length: %zu\r\n"
+                                  "\r\n",
+                                  strlen(body));
+
         // TODO: Send response via SSL
-        send_all_ssl(ssl, header, header_len);
-        send_all_ssl(ssl, body, body_len);
+        if (header_len > 0)
+            SSL_write(ssl, header, header_len);
+        SSL_write(ssl, body, (int)strlen(body));
         return;
     }
 
-    struct stat st;
-    long file_size = 0;
-    if (stat(path, &st) == 0)
+    const char *content_type = "application/octet-stream";
+    const char *ext = strrchr(path, '.');
+    if (ext)
     {
-        file_size = (long)st.st_size;
+        if (strcmp(ext, ".html") == 0)
+        {
+            content_type = "text/html; charset=UTF-8";
+        }
+        else if (strcmp(ext, ".txt") == 0)
+        {
+            content_type = "text/plain; charset=UTF-8";
+        }
+        else if (strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0)
+        {
+            content_type = "image/jpeg";
+        }
+        else if (strcmp(ext, ".m3u8") == 0)
+        {
+            content_type = "application/vnd.apple.mpegurl";
+        }
     }
 
-    const char *ctype = content_type_for_path(path);
+    if (fseek(file, 0, SEEK_END) != 0)
+    {
+        fclose(file);
+        return;
+    }
+    long fsize = ftell(file);
+    if (fsize < 0)
+    {
+        fclose(file);
+        return;
+    }
+    rewind(file);
 
     char header[512];
     int header_len = snprintf(header, sizeof(header),
                               "HTTP/1.1 200 OK\r\n"
                               "Content-Type: %s\r\n"
                               "Content-Length: %ld\r\n"
-                              "Connection: close\r\n\r\n",
-                              ctype, file_size);
+                              "\r\n",
+                              content_type, fsize);
 
     // TODO: Send response header and file content via SSL
-    send_all_ssl(ssl, header, header_len);
+    if (header_len > 0)
+        SSL_write(ssl, header, header_len);
 
-    while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0)
+    size_t n;
+    while ((n = fread(buffer, 1, sizeof(buffer), file)) > 0)
     {
-        // TODO: Send file data via SSL
-        if (!send_all_ssl(ssl, buffer, (int)bytes_read))
+        size_t sent = 0;
+        while (sent < n)
         {
-            break;
+            int w = SSL_write(ssl, buffer + sent, (int)(n - sent));
+            if (w <= 0)
+            {
+                fclose(file);
+                return;
+            }
+            sent += (size_t)w;
         }
     }
 
@@ -388,12 +384,6 @@ void proxy_remote_file(SSL *ssl, const char *request)
     if (remote_socket == -1)
     {
         printf("Failed to create remote socket\n");
-        const char *resp =
-            "HTTP/1.1 502 Bad Gateway\r\n"
-            "Content-Type: text/plain; charset=UTF-8\r\n"
-            "Content-Length: 11\r\n\r\n"
-            "Bad Gateway";
-        send_all_ssl(ssl, resp, (int)strlen(resp));
         return;
     }
 
@@ -406,12 +396,6 @@ void proxy_remote_file(SSL *ssl, const char *request)
     {
         printf("Failed to connect to remote server\n");
         close(remote_socket);
-        const char *resp =
-            "HTTP/1.1 502 Bad Gateway\r\n"
-            "Content-Type: text/plain; charset=UTF-8\r\n"
-            "Content-Length: 11\r\n\r\n"
-            "Bad Gateway";
-        send_all_ssl(ssl, resp, (int)strlen(resp));
         return;
     }
 
@@ -420,9 +404,16 @@ void proxy_remote_file(SSL *ssl, const char *request)
     while ((bytes_read = recv(remote_socket, buffer, sizeof(buffer), 0)) > 0)
     {
         // TODO: Forward response to client via SSL
-        if (!send_all_ssl(ssl, buffer, (int)bytes_read))
+        size_t sent = 0;
+        while (sent < (size_t)bytes_read)
         {
-            break;
+            int w = SSL_write(ssl, buffer + sent, (int)((size_t)bytes_read - sent));
+            if (w <= 0)
+            {
+                close(remote_socket);
+                return;
+            }
+            sent += (size_t)w;
         }
     }
 
