@@ -18,7 +18,6 @@ void send_local_file(SSL *ssl, const char *path);
 void proxy_remote_file(SSL *ssl, const char *request);
 int file_exists(const char *filename);
 
-/* ---- URL decode helpers (for spaces, % signs, etc.) ---- */
 static int hex_value(char c)
 {
     if ('0' <= c && c <= '9')
@@ -32,7 +31,6 @@ static int hex_value(char c)
 
 static void url_decode(const char *src, char *dst, size_t dst_size)
 {
-    /* robust approach */
     if (!src || !dst || dst_size == 0)
         return;
 
